@@ -1,81 +1,85 @@
 use anchor_lang::prelude::*;
+use anchor_lang::system_program::{transfer, Transfer};
 
+// 确保 Program ID 是 Blueprint 平台要求的固定 ID
 declare_id!("22222222222222222222222222222222222222222222");
 
 #[program]
 pub mod blueshift_anchor_vault {
     use super::*;
 
-    // 使用 Deposit 上下文来创建和存入
-    pub fn deposit(ctx: Context<Depoist>, amount: u64) -> Result<()> {
-        // 1. 检查存入金额是否大于0 (账户的租金由 `init` 约束自动处理)
-        require_gt!(amount, 0, VaultError::InvalidAmount);
+    // 存款指令
+    pub fn deposit(ctx: Context<VaultAction>, amount: u64) -> Result<()> {
+        // 1. 验证金库为空
+        require_eq!(ctx.accounts.vault.lamports(), 0, VaultError::VaultAlreadyExists);
 
-        // 2. 执行从用户到金库的转账
-        // 因为 `init` 约束已经创建了 vault 账户并支付了租金,
-        // 我们只需要把额外的 amount 转进去
-        let cpi_context = CpiContext::new(
+        // 2. 确保存款金额超过免租金最低限额
+        require_gt!(amount, Rent::get()?.minimum_balance(0), VaultError::InvalidAmount);
+
+        // 3. 使用 CPI 调用系统程序，将 lamports 从签名者转移到金库
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.signer.to_account_info(),
+            to: ctx.accounts.vault.to_account_info(),
+        };
+        let cpi_context = CpiContext::new(ctx.accounts.system_program.to_account_info(), cpi_accounts);
+        transfer(cpi_context, amount)?;
+
+        Ok(())
+    }
+
+    // 提款指令
+    pub fn withdraw(ctx: Context<VaultAction>) -> Result<()> {
+        // 1. 验证保险库中是否有 lamports
+        require_gt!(ctx.accounts.vault.lamports(), 0, VaultError::NoLamportsToWithdraw);
+
+        // 2. 获取金库的总余额
+        let amount_to_withdraw = ctx.accounts.vault.lamports();
+
+        // 3. 【关键修复】创建 PDA 签名者种子
+        let signer_key = ctx.accounts.signer.key();
+        let bump_seed = [ctx.bumps.vault]; // 创建一个具名变量，延长其生命周期
+        let signer_seeds = &[b"vault", signer_key.as_ref(), &bump_seed]; // 引用该具名变量
+
+        // 关键：把“种子集合（外层）”绑定到变量，延长生命周期
+        let signer_seeds_arr: &[&[&[u8]]] = &[signer_seeds];
+
+        // 4. 执行 CPI 转账
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.vault.to_account_info(),
+            to: ctx.accounts.signer.to_account_info(),
+        };
+        let cpi_context = CpiContext::new_with_signer(
             ctx.accounts.system_program.to_account_info(),
-            anchor_lang::system_program::Transfer {
-                from: ctx.accounts.signer.to_account_info(),
-                to: ctx.accounts.vault.to_account_info()
-            }
+            cpi_accounts,
+            signer_seeds_arr
         );
-        anchor_lang::system_program::transfer(cpi_context, amount)?;
+        transfer(cpi_context, amount_to_withdraw)?;
+        
         Ok(())
     }
-
-    // 使用 Withdraw 上下文来取出和关闭
-    // 这个函数不再需要 amount 参数，因为它会取出所有余额并关闭账户
-    pub fn withdraw(ctx: Context<Withdraw>) -> Result<()> {
-        // 不需要任何代码！
-        // `#[account(mut, close = signer)]` 约束已经为你处理了所有事情：
-        // 1. 将 vault 账户中的所有 lamports (包括租金) 安全地转给 signer。
-        // 2. 关闭 vault 账户。
-        Ok(())
-    }
-
 }
 
-// 用于存款的账户结构
+// 账户上下文
 #[derive(Accounts)]
-pub struct Depoist<'info> {
+pub struct VaultAction<'info> {
     #[account(mut)]
     pub signer: Signer<'info>,
-
     #[account(
-        init, // <-- 关键点: 第一次调用时创建账户
-        payer = signer, // <-- 指定创建账户的付款人
-        space = 8, // <-- 为 vault 账户分配空间 (8字节用于discriminator)
-        seeds = [b"vault", signer.key().as_ref()],
-        bump,
-    )]
-    pub vault: Account<'info, VaultState>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct Withdraw<'info>{
-    #[account(mut)]
-    pub signer: Signer<'info>,
-
-        #[account(
         mut,
         seeds = [b"vault", signer.key().as_ref()],
         bump,
-        close = signer, // <-- 关键点: 交易结束后将账户余额转给 signer 并关闭账户
     )]
-    pub vault: Account<'info, VaultState>,
+    pub vault: SystemAccount<'info>,
+    pub system_program: Program<'info, System>,
 }
 
-#[account]
-pub struct VaultState {}
-
+// 错误码
 #[error_code]
-pub enum VaultError{
+pub enum VaultError {
     #[msg("Vault already exists")]
     VaultAlreadyExists,
     #[msg("Invalid amount")]
     InvalidAmount,
+    #[msg("No lamports to withdraw from vault")]
+    NoLamportsToWithdraw,
 }
-
